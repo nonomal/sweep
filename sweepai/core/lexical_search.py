@@ -1,310 +1,274 @@
-import shutil
-import traceback
-from dataclasses import dataclass
-import itertools
-import re
-from whoosh.analysis import Tokenizer, Token
+from collections.abc import Iterable
+import multiprocessing
 import os
-import random
+import re
+import subprocess
 import time
-from whoosh.query import Or, Term
 
-random.seed(os.getpid())
+import tantivy
+from diskcache import Cache
+from loguru import logger
+from redis import Redis
+from tqdm import tqdm
+from sweepai.utils.streamable_functions import streamable
+
+from sweepai.utils.timer import Timer
+from sweepai.config.server import CACHE_DIRECTORY, FILE_CACHE_DISABLED, REDIS_URL
+from sweepai.core.entities import Snippet
+from sweepai.core.repo_parsing_utils import directory_to_chunks
+from sweepai.core.vector_db import multi_get_query_texts_similarity
+from sweepai.dataclasses.files import Document
+from sweepai.config.client import SweepConfig
+
+token_cache = Cache(f'{CACHE_DIRECTORY}/token_cache') # we instantiate a singleton, diskcache will handle concurrency
+lexical_index_cache = Cache(f'{CACHE_DIRECTORY}/lexical_index_cache')
+snippets_cache = Cache(f'{CACHE_DIRECTORY}/snippets_cache')
+CACHE_VERSION = "v1.0.16"
+
+if FILE_CACHE_DISABLED:
+    redis_client = None
+
+# pylint: disable=no-member
+schema_builder = tantivy.SchemaBuilder()
+schema_builder.add_text_field("title", stored=True)
+schema_builder.add_text_field("body", stored=True)
+schema_builder.add_integer_field("doc_id", stored=True)
+schema = schema_builder.build()
+# pylint: enable=no-member
+
+redis_client = Redis.from_url(REDIS_URL) if REDIS_URL else None
 
 
-def tokenize_call(code, top_words=None):
-    def check_valid_token(token):
-        in_top_words = False
-        if top_words:
-            in_top_words = token in top_words
-        return token and len(token) > 1 and not in_top_words
+class CustomIndex:
+    def __init__(self, cache_path: str = None):
+        os.makedirs(cache_path, exist_ok=True)
+        self.index = tantivy.Index(schema) # pylint: disable=no-member
+    
+    def add_documents(self, documents: Iterable):
+        writer = self.index.writer()
+        for doc_id, (title, text) in enumerate(documents):
+            writer.add_document(
+                tantivy.Document( # pylint: disable=no-member
+                    title=title,
+                    body=text,
+                    doc_id=doc_id
+                )
+            )
+        writer.commit()
+    
+    def search_index(self, query: str) -> list[tuple[str, float, dict]]:
+        query = tokenize_code(query)
+        query = self.index.parse_query(query)
+        searcher = self.index.searcher() # for some reason, the first searcher is empty
+        for i in range(100):
+            searcher = self.index.searcher()
+            if searcher.num_docs > 0:
+                break
+            print(f"Index is empty, sleeping for {0.01 * i} seconds")
+            time.sleep(0.01)
+        else:
+            raise Exception("Index is empty")
+        results = searcher.search(query, limit=200).hits
+        return [(searcher.doc(doc_id)["title"][0], score, searcher.doc(doc_id)) for score, doc_id in results]
 
-    matches = re.finditer(r"\b\w+\b", code)
-    pos = 0
-    valid_tokens = []
+
+variable_pattern = re.compile(r"([A-Z][a-z]+|[a-z]+|[A-Z]+(?=[A-Z]|$))")
+
+
+def tokenize_code(code: str) -> str:
+    matches = re.finditer(r"\b\w{2,}\b", code)
+    tokens = []
     for m in matches:
         text = m.group()
-        span_start = m.start()
-        span_end = m.end()
 
-        if "_" in text:  # snakecase
-            offset = 0
-            for part in text.split("_"):
-                if check_valid_token(part):
-                    valid_tokens.append(
-                        Token(
-                            text=part.lower(),
-                            pos=pos,
-                            startchar=span_start + offset,
-                            end_pos=pos + 1,
-                            endchar=span_start + len(part) + offset,
-                        )
-                    )
-                    pos += 1
-                offset += len(part) + 1
-        elif re.search(r"[A-Z][a-z]|[a-z][A-Z]", text):  # pascal and camelcase
-            parts = re.findall(
-                r"([A-Z][a-z]+|[a-z]+|[A-Z]+(?=[A-Z]|$))", text
-            )  # first one "MyVariable" second one "myVariable" third one "MYVariable"
-            offset = 0
-            for part in parts:
-                if check_valid_token(part):
-                    valid_tokens.append(
-                        Token(
-                            text=part.lower(),
-                            pos=pos,
-                            startchar=span_start + offset,
-                            end_pos=pos + 1,
-                            endchar=span_start + len(part) + offset,
-                        )
-                    )
-                    pos += 1
-                offset += len(part)
-        else:  # everything else
-            if check_valid_token(text):
-                valid_tokens.append(
-                    Token(
-                        text=text.lower(),
-                        pos=pos,
-                        startchar=span_start,
-                        end_pos=pos + 1,
-                        endchar=span_start + len(text),
-                    )
-                )
-                pos += 1
-    return valid_tokens
+        for section in text.split("_"):
+            for part in variable_pattern.findall(section):
+                if len(part) < 2:
+                    continue
+                # if len(part) < 5:
+                #     tokens.append(part.lower())
+                # if more than half of the characters are letters 
+                # and the ratio of unique characters to the number of characters is less than 5
+                if sum(1 for c in part if 'a' <= c <= 'z' or 'A' <= c <= 'Z' or '0' <= c <= '9') > len(part) // 2 \
+                    and len(part) / len(set(part)) < 4:
+                    tokens.append(part.lower())
+    
+    return " ".join(tokens)
 
-
-def construct_query(query, top_words=None):
-    terms = tokenize_call(query, top_words)
-    bigrams = construct_bigrams(terms)
-    trigrams = construct_trigrams(terms)
-    terms.extend(bigrams)
-    terms.extend(trigrams)
-    return Or([Term("content", term.text) for term in terms])
-
-
-def construct_bigrams(tokens):
-    res = []
-    prev_token = None
-    for token in tokens:
-        if prev_token:
-            joined_token = Token(
-                text=prev_token.text + "_" + token.text,
-                pos=prev_token.pos,
-                startchar=prev_token.startchar,
-                end_pos=token.end_pos,
-                endchar=token.endchar,
-            )
-            res.append(joined_token)
-        prev_token = token
-    return res
-
-
-def construct_trigrams(tokens):
-    res = []
-    prev_prev_token = None
-    prev_token = None
-    for token in tokens:
-        if prev_token and prev_prev_token:
-            joined_token = Token(
-                text=prev_prev_token.text + "_" + prev_token.text + "_" + token.text,
-                pos=prev_prev_token.pos,
-                startchar=prev_prev_token.startchar,
-                end_pos=token.end_pos,
-                endchar=token.endchar,
-            )
-            res.append(joined_token)
-        prev_prev_token = prev_token
-        prev_token = token
-    return res
-
-
-class CodeTokenizer(Tokenizer):
-    def __init__(self, top_words=None):
-        self.top_words = top_words
-
-    def __call__(
-        self,
-        value,
-        positions=False,
-        chars=False,
-        keeporiginal=False,
-        removestops=True,
-        start_pos=0,
-        start_char=0,
-        mode="",
-        **kwargs,
-    ):
-        tokens = tokenize_call(value, self.top_words)
-        bigrams = construct_bigrams(tokens)
-        trigrams = construct_trigrams(tokens)
-        tokens.extend(bigrams)
-        tokens.extend(trigrams)
-        for token in tokens:
-            yield token
-
-
-@dataclass
-class Document:
-    title: str
-    content: str
-    start: int
-    end: int
-
-
-def snippets_to_docs(snippets, len_repo_cache_dir):
+def snippets_to_docs(snippets: list[Snippet], len_repo_cache_dir):
     docs = []
     for snippet in snippets:
         docs.append(
             Document(
-                title=snippet.file_path[len_repo_cache_dir:],
-                content=snippet.content,
-                start=snippet.start,
-                end=snippet.end,
+                title=f"{snippet.file_path[len_repo_cache_dir:]}:{snippet.start}-{snippet.end}",
+                content=snippet.get_snippet(add_ellipsis=False, add_lines=False),
             )
         )
     return docs
 
 
-from whoosh.qparser import QueryParser, OrGroup
-import os
-from whoosh import index
-from whoosh.fields import Schema, TEXT, NUMERIC
-
-
-def get_stopwords(snippets):
-    from collections import Counter
-
-    # Assuming your CodeTokenizer is defined and works for your specific content
-    tokenizer = CodeTokenizer()
-
-    # Let's say your content is in a variable called "content"
-    chunks = [snippet.content for snippet in snippets]
-    tokens = [t.text for t in tokenizer("\n".join(chunks))]
-    # Count the frequency of each word
-    word_counts = Counter(tokens)
-
-    # Identify the top 10 most frequent words
-    top_words = {word for word, _ in word_counts.most_common(10)}
-    return top_words
-
-
-def prepare_index_from_snippets(snippets, len_repo_cache_dir=0):
-    all_docs = snippets_to_docs(snippets, len_repo_cache_dir)
-    # Tokenizer that splits by whitespace and common code punctuation
-    stop_words = get_stopwords(snippets)
-    tokenizer = CodeTokenizer(stop_words)
-
-    # An example analyzer for code
-    code_analyzer = tokenizer
-
-    schema = Schema(
-        title=TEXT(stored=True, analyzer=code_analyzer),
-        content=TEXT(stored=True, analyzer=code_analyzer),
-        start=NUMERIC(stored=True),
-        end=NUMERIC(stored=True),
+@streamable
+def prepare_index_from_snippets(
+    snippets: list[Snippet],
+    len_repo_cache_dir: int = 0,
+    do_not_use_file_cache: bool = False,
+    cache_path: str = None,
+) -> CustomIndex | None:
+    all_docs: list[Document] = snippets_to_docs(snippets, len_repo_cache_dir)
+    if len(all_docs) == 0:
+        return None
+    index = CustomIndex(
+        cache_path=cache_path
     )
-
-    # Create a directory to store the index
-    pid = random.randint(0, 1000)
-    shutil.rmtree(f"cache/indices/indexdir_{pid}", ignore_errors=True)
-    os.makedirs(f"cache/indices", exist_ok=True)
-    os.mkdir(f"cache/indices/indexdir_{pid}")
-
-    # Create the index based on the schema
-    ix = index.create_in(f"cache/indices/indexdir_{pid}", schema)
-    # writer.cancel()
-    writer = ix.writer()
-    for doc in all_docs:
-        writer.add_document(
-            title=doc.title, content=doc.content, start=doc.start, end=doc.end
-        )
-
-    writer.commit()
-    return ix
-
-
-@dataclass
-class Documentation:
-    url: str
-    content: str
-
-
-def prepare_index_from_docs(docs):
-    all_docs = [Documentation(url, content) for url, content in docs]
-    tokenizer = CodeTokenizer()
-    # An example analyzer for code
-    code_analyzer = tokenizer
-
-    schema = Schema(
-        url=TEXT(stored=True, analyzer=code_analyzer),
-        content=TEXT(stored=True, analyzer=code_analyzer),
-    )
-
-    # Create a directory to store the index
-    pid = random.randint(0, 100)
-    if not os.path.exists(f"indexdir_{pid}"):
-        os.mkdir(f"indexdir_{pid}")
-
-    # Create the index based on the schema
-    ix = index.create_in("indexdir_{pid}", schema)
-    # writer.cancel()
-    writer = ix.writer()
-    for doc in all_docs:
-        writer.add_document(url=doc.url, content=doc.content)
-
-    writer.commit()
-    return ix
-
-
-def search_docs(query, ix):
-    """Title, score, content"""
-    # Create a query parser for the "content" field of the index
-    q = construct_query(query)
-
-    # Search the index
-    with ix.searcher() as searcher:
-        results = searcher.search(q, limit=None, terms=True)
-        # return dictionary of content to scores
-        res = {}
-        for hit in results:
-            if hit["url"] not in res:
-                res[hit["url"]] = hit.score
+    yield "Tokenizing documents...", index
+    all_tokens = []
+    try:
+        with Timer() as timer:
+            for doc in all_docs:
+                all_tokens.append(token_cache.get(doc.content + CACHE_VERSION))
+            misses = [i for i, token in enumerate(all_tokens) if token is None]
+            workers = multiprocessing.cpu_count() // 2
+            if workers > 1:
+                with multiprocessing.Pool(processes=multiprocessing.cpu_count() // 2) as p:
+                    missed_tokens = p.map(
+                        tokenize_code,
+                        tqdm(
+                            [all_docs[i].content for i in misses],
+                            total=len(misses),
+                            desc="Tokenizing documents"
+                        )
+                    )
             else:
-                res[hit["url"]] = max(hit.score, res[hit["url"]])
-        # min max normalize scores from 0.5 to 1
+                missed_tokens = [
+                    tokenize_code(all_docs[i].content) for i in misses
+                ]
+            for i, token in enumerate(missed_tokens):
+                all_tokens[misses[i]] = token
+                token_cache[all_docs[misses[i]].content + CACHE_VERSION] = token
+        logger.debug(f"Tokenizing documents took {timer.time_elapsed} seconds")
+        yield "Building lexical index...", index
+        all_titles = [doc.title for doc in all_docs]
+        with Timer() as timer:
+            index.add_documents(
+                tqdm(zip(all_titles, all_tokens), total=len(all_docs), desc="Indexing")
+            )
+        logger.debug(f"Indexing took {timer.time_elapsed} seconds")
+    except FileNotFoundError as e:
+        logger.exception(e)
+
+    yield "Index built", index
+    return index
+
+
+def search_index(query: str, index: CustomIndex):
+    """Search the index based on a query.
+
+    This function takes a query and an index as input and returns a dictionary of document IDs
+    and their corresponding scores.
+    """
+    # Create a query parser for the "content" field of the index
+    results_with_metadata = index.search_index(query)
+    # Search the index
+    res = {}
+    for doc_id, score, _ in results_with_metadata:
+        if doc_id not in res:
+            res[doc_id] = score
+    # min max normalize scores from 0.5 to 1
+    if len(res) == 0:
+        max_score = 1
+        min_score = 0
+    else:
         max_score = max(res.values())
         min_score = min(res.values()) if min(res.values()) < max_score else 0
-        return {k: (v - min_score) / (max_score - min_score) for k, v in res.items()}
+    res = {k: (v - min_score) / (max_score - min_score) for k, v in res.items()}
+    return res
+
+SNIPPET_FORMAT = """File path: {file_path}
+
+{contents}"""
+
+# @file_cache(ignore_params=["snippets"])
+def compute_vector_search_scores(queries: list[str], snippets: list[Snippet]):
+    # get get dict of snippet to score
+    with Timer() as timer:
+        snippet_str_to_contents = {
+            snippet.denotation: SNIPPET_FORMAT.format(
+                file_path=snippet.file_path,
+                contents=snippet.get_snippet(add_ellipsis=False, add_lines=False),
+            )
+            for snippet in snippets
+        }
+    logger.info(f"Snippet to contents took {timer.time_elapsed:.2f} seconds")
+    snippet_contents_array = list(snippet_str_to_contents.values())
+    multi_query_snippet_similarities = multi_get_query_texts_similarity(
+        queries, snippet_contents_array
+    )
+    snippet_denotations = [snippet.denotation for snippet in snippets]
+    snippet_denotation_to_scores = [{
+        snippet_denotations[i]: score
+        for i, score in enumerate(query_snippet_similarities)
+    } for query_snippet_similarities in multi_query_snippet_similarities]
+    return snippet_denotation_to_scores
+
+def get_lexical_cache_key(
+    repo_directory: str, 
+    commit_hash: str | None = None, 
+    seed: str = ""
+):
+    commit_hash = commit_hash or subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_directory, capture_output=True, text=True).stdout.strip()
+    repo_directory = os.path.basename(repo_directory)
+    return f"{repo_directory}_{commit_hash}_{CACHE_VERSION}_{seed}"
+
+@streamable
+def prepare_lexical_search_index(
+    repo_directory: str,
+    sweep_config: SweepConfig,
+    do_not_use_file_cache: bool = False, # choose to not cache results
+    seed: str = "" # used for lexical cache key
+):
+    lexical_cache_key = get_lexical_cache_key(repo_directory, seed=seed)
+
+    yield "Collecting snippets...", [], None
+    snippets_results = snippets_cache.get(lexical_cache_key)
+    if snippets_results is None:
+        snippets, file_list = directory_to_chunks(
+            repo_directory, sweep_config, do_not_use_file_cache=do_not_use_file_cache
+        )
+        snippets_cache[lexical_cache_key] = snippets, file_list
+    else:
+        snippets, file_list = snippets_results
+
+    yield "Building index...", snippets, None
+    # for message, index in prepare_index_from_snippets.stream(
+    #     snippets,
+    #     len_repo_cache_dir=len(repo_directory) + 1,
+    #     do_not_use_file_cache=do_not_use_file_cache,
+    #     cache_path=f"{CACHE_DIRECTORY}/lexical_index_cache/{lexical_cache_key}"
+    # ):
+    #     yield message, index
+    index = prepare_index_from_snippets(
+        snippets,
+        len_repo_cache_dir=len(repo_directory) + 1,
+        do_not_use_file_cache=do_not_use_file_cache,
+        cache_path=f"{CACHE_DIRECTORY}/lexical_index_cache/{lexical_cache_key}"
+    )
+        # yield message, index
+    
+    yield "Lexical index built.", snippets, index
+
+    return snippets, index
 
 
-def search_index(query, ix):
-    """Title, score, content"""
-    try:
-        # Create a query parser for the "content" field of the index
-        q = construct_query(query)
-
-        # Search the index
-        with ix.searcher() as searcher:
-            results = searcher.search(q, limit=None, terms=True)
-            # return dictionary of content to scores
-            res = {}
-            for hit in results:
-                key = f"{hit['title']}:{str(hit['start'])}:{str(hit['end'])}"
-                if key not in res:
-                    res[key] = hit.score
-            # min max normalize scores from 0.5 to 1
-            if len(res) == 0:
-                max_score = 1
-                min_score = 0
-            else:
-                max_score = max(res.values())
-                min_score = min(res.values()) if min(res.values()) < max_score else 0
-            return {
-                k: (v - min_score) / (max_score - min_score) for k, v in res.items()
-            }
-    except Exception as e:
-        print(e)
-        traceback.print_exc()
-        return {}
+if __name__ == "__main__":
+    repo_directory = os.getenv("REPO_DIRECTORY")
+    sweep_config = SweepConfig()
+    assert repo_directory
+    import time
+    start = time.time()
+    _, _ , index = prepare_lexical_search_index(repo_directory, sweep_config, None)
+    result = search_index("logger export", index)
+    print("Time taken:", time.time() - start)
+    # print some of the keys
+    print(list(result.keys())[:5])
+    # print the first 2 result keys sorting by value
+    print(sorted(result.items(), key=lambda x: result.get(x, 0), reverse=True)[:5])

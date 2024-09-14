@@ -1,5 +1,7 @@
 {
-  "index": "🚀 Getting Started",
+  "index": "What's Sweep?",
+  "getting-started": "🚀 Getting Started",
+  "cli": "🔧 Sweep CLI",
   "deployment": "🏠 Self-Host",
   "usage": "📖 Usage",
   "about": "👋 About",
@@ -18,10 +20,16 @@
     "href": "mailto:team@sweep.dev",
     "newWindow": true
   },
+  "community": {
+    "title": "Community",
+    "type": "page",
+    "href": "https://community.sweep.dev",
+    "newWindow": true
+  },
   "payment": {
     "title": "Sweep Pro",
     "type": "page",
-    "href": "https://buy.stripe.com/6oE5npbGVbhC97afZ4",
+    "href": "https://buy.stripe.com/00g5npeT71H2gzCfZ8",
     "newWindow": true
   }
 }

@@ -1,4 +1,4 @@
-FROM python:3.11-slim as base
+FROM python:3.10-slim as base
 
 ENV PYTHONDONTWRITEBYTECODE 1
 ENV PYTHONUNBUFFERED 1
@@ -8,44 +8,42 @@ ENV PORT=${PORT:-8080}
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git build-essential autoconf automake pkg-config libjansson-dev docker.io \
+    && apt-get install -y --no-install-recommends git curl redis-server npm build-essential pkg-config libssl-dev \
+       cmake pkg-config libicu-dev zlib1g-dev libcurl4-openssl-dev libssl-dev ruby-dev \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone https://github.com/universal-ctags/ctags.git && \
-    cd ctags && \
-    ./autogen.sh && \
-    ./configure && \
-    make && make install
+RUN gem install github-linguist
 
-RUN if [ "$(uname -m)" = "x86_64" ]; then \
-    pip install torch --index-url https://download.pytorch.org/whl/cpu; \
-  else \
-    pip install torch; \
-  fi && pip install sentence_transformers --no-cache-dir
+RUN curl -LO https://github.com/BurntSushi/ripgrep/releases/download/13.0.0/ripgrep_13.0.0_amd64.deb && \
+    dpkg -i ripgrep_13.0.0_amd64.deb && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y 
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN git clone https://github.com/BurntSushi/ripgrep
+RUN cd ripgrep && \
+    cargo build --release && \
+    ./target/release/rg --version
 
-COPY pyproject.toml ./
+ENV VIRTUAL_ENV=/usr/local
+RUN curl -sSL https://astral.sh/uv/install.sh -o /install.sh && chmod 755 /install.sh && /install.sh && rm /install.sh
 
-RUN pip install --no-cache-dir poetry \
-    && poetry export -f requirements.txt --without-hashes -o requirements.txt \
-    && pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt ./
 
-RUN playwright install
-RUN apt-get update && apt-get install -y screen
-RUN apt-get update && apt-get install -y redis-server
+RUN pip install --no-cache -r requirements.txt
 
-FROM base as final
-
-COPY sweepai/startup.py /app/sweepai/startup.py
-RUN python sweepai/startup.py
+RUN npm install -g prettier@2.0.4 @types/react @types/react-dom typescript eslint@8.57.0 
+RUN npm install react react-dom
+RUN npm install @typescript-eslint/parser @typescript-eslint/eslint-plugin eslint-plugin-import eslint-plugin-react --save-dev
 
 COPY sweepai /app/sweepai
-COPY bin/startup.sh /app/startup.sh
+COPY tests /app/tests
+ENV PYTHONPATH=.
 COPY redis.conf /app/redis.conf
-RUN chmod u+x /app/startup.sh
+COPY bin /app/bin
+RUN chmod a+x /app/bin/startup.sh
 
 EXPOSE 8080
-CMD ["/app/startup.sh"]
+CMD ["bash", "-c", "chmod a+x /app/bin/startup.sh && /app/bin/startup.sh"]
 
 LABEL org.opencontainers.image.description="Backend for Sweep, an AI-powered junior developer"
 LABEL org.opencontainers.image.source="https://github.com/sweepai/sweep"

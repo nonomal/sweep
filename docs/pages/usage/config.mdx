@@ -1,8 +1,37 @@
 # Sweep Config
 
-In this article, we will explore ways to configure Sweep. Mainly, we will focus on the `sweep.yaml` file, which is the main configuration file for Sweep.
+You can configure Sweep by modifying the `sweep.yaml` file, which should be in the root directory of your repository.
 
-## Config Table
+After making your first Sweep issue, Sweep will make a PR to add the config file for you. If it's not there, you can create it yourself and add the following default config file:
+
+<details>
+<summary>Default content for&nbsp;`sweep.yaml`</summary>
+```yaml
+# Sweep AI turns bugs & feature requests into code changes (https://sweep.dev)
+# For details on our config file, check out our docs at https://docs.sweep.dev/usage/config
+
+# This is the branch that Sweep will develop from and make pull requests to. Most people use 'main' or 'master' but some users also use 'dev' or 'staging'.
+branch: 'main'
+
+# By default Sweep will read the logs and outputs from your existing Github Actions. To disable this, set this to false.
+gha_enabled: True
+
+# This is the description of your project. It will be used by sweep when creating PRs. You can tell Sweep what's unique about your project, what frameworks you use, or anything else you want.
+#
+# Example:
+# description: sweepai/sweep is a python project. The main api endpoints are in sweepai/api.py. Write code that adheres to PEP8.
+description: ''
+
+# This sets whether to create pull requests as drafts. If this is set to True, then all pull requests will be created as drafts and GitHub Actions will not be triggered.
+draft: False
+
+# This is a list of directories that Sweep will not be able to edit. In our example, Sweep is unable to modify the .github folder as we do not want Sweep to modify our GitHub Actions.
+blocked_dirs: [".github/"]
+```
+
+</details>
+
+### Config Table
 | Key | Type | Description |
 | --- | --- | --- |
 | `gha_enabled` | `bool` | Whether or not to enable GitHub Actions |
@@ -10,12 +39,10 @@ In this article, we will explore ways to configure Sweep. Mainly, we will focus 
 | `blocked_dirs` | `list` | A list of directories to ignore |
 | `draft` | `bool` | Whether or not to create PRs as drafts |
 | `description` | `str` | The description of the repository |
-| `docs` | `dict` | A dictionary of documentation links |
-| `sandbox` | `dict` | Sandbox settings for linting and formatting |
 
 ---
 
-## gha_enabled
+### `gha_enabled`
 ```yaml
 gha_enabled: True
 ```
@@ -23,19 +50,19 @@ Possible Values: True, False
 
 This setting determines whether or not to enable GitHub Actions. If this is set to `False`, then Sweep will not read the results of GitHub Actions.
 
-## branch
+### `branch`
 ```yaml
 branch: main
 ```
 This setting determines which branch Sweep will develop from and make pull requests to.
 
-## blocked_dirs
+### `blocked_dirs`
 ```yaml
 blocked_dirs: [".github/", "other_dir"]
 ```
 This setting lists all of the directories that Sweep will not be able to edit. In our example, Sweep is unable to modify the `.github` folder as we do not want Sweep to modify our GitHub Actions.
 
-## draft
+### `draft`
 ```yaml
 draft: False
 ```
@@ -43,50 +70,11 @@ Possible Values: True, False
 
 This setting determines whether or not to create pull requests as drafts. If this is set to `True`, then all pull requests will be created as drafts and **GitHub Actions will not be triggered**.
 
-## description
+### `description`
 ```yaml
 description: "project description and standards to follow"
 ```
 This setting is the description of the repository that will be passed to Sweep. Please include details that Sweep may need to understand the repository. You may also include details about standards to follow here.
-
-## docs
-```yaml
-docs:
-  - Modal: ["https://modal.com/docs/reference", "Modal is used for serverless deployment"]
-  - PyGitHub: ["https://pygithub.readthedocs.io/en/latest/", "PyGitHub is used for interacting with GitHub"]
-```
-This setting contains documentation links that Sweep is able to search through. This is helpful for packages with syntax that has changed or newer packages.
-
-**Important**: Please contact us if you would like to add a documentation link so we can add it to our database.
-
-## sandbox
-Python:
-```yaml
-sandbox:
-  enabled: true
-  image: "Python3"
-  install: "python -m venv venv; . venv/bin/activate; pip install black"
-  formatter: ". venv/bin/activate; black {files}"
-```
-
-JavaScript/TypeScript
-```yaml
-sandbox:
-  enabled: true
-  image: "Nodejs"
-  install: "npm install --save-dev prettier"
-  formatter: "npx prettier --write {files}"
-```
-
-This setting contains sandbox settings for linting and formatting. This is helpful when changes are required to be formatted and tested.
-
-### install
-This command is executed when setting up the environment.
-
-### formatter
-This command is executed after Sweep changes a file and before Sweep commits the changes. The `{files}` placeholder is replaced with the files that Sweep has changed.
-
-**Important**: Please contact us if you would like to add a sandbox setting, so we can add it to our database.
 
 ---
 
@@ -99,6 +87,4 @@ branch: main
 blocked_dirs: [".github/"]
 draft: False
 description: "sweepai/sweep is a python 3.10 project. The main api endpoints are in sweepai/api.py. Write code that adheres to PEP8."
-docs:
-  - Modal: https://modal.com/docs/reference
-  - PyGitHub: https://pygithub.readthedocs.io/en/latest/
+```

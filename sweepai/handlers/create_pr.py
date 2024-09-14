@@ -1,113 +1,105 @@
-import datetime
-from typing import Generator
+"""
+create_pr is a function that creates a pull request from a list of file change requests.
+It is also responsible for handling Sweep config PR creation. test
+"""
 
-import openai
+import copy
+
+import openai  
 from github.Repository import Repository
 from loguru import logger
 
-from sweepai.config.client import UPDATES_MESSAGE, SweepConfig, get_blocked_dirs
+from sweepai.agents.modify import modify
+from sweepai.config.client import DEFAULT_RULES_STRING
 from sweepai.config.server import (
-    DB_MODAL_INST_NAME,
     ENV,
     GITHUB_BOT_USERNAME,
     GITHUB_CONFIG_BRANCH,
     GITHUB_DEFAULT_CONFIG,
     GITHUB_LABEL_NAME,
-    MONGODB_URI,
-    OPENAI_API_KEY,
 )
 from sweepai.core.entities import (
     FileChangeRequest,
     MaxTokensExceeded,
-    MockPR,
-    ProposedIssue,
-    PullRequest,
 )
-from sweepai.core.sweep_bot import SweepBot
-from sweepai.events import InstallationCreatedRequest
-from sweepai.utils.chat_logger import ChatLogger
 from sweepai.utils.event_logger import posthog
-from sweepai.utils.github_utils import get_github_client
-
-openai.api_key = OPENAI_API_KEY
+from sweepai.utils.github_utils import ClonedRepo
 
 num_of_snippets_to_query = 10
 max_num_of_snippets = 5
 
 INSTRUCTIONS_FOR_REVIEW = """\
-💡 To get Sweep to edit this pull request, you can:
-* Leave a comment below to get Sweep to edit the entire PR
-* Leave a comment in the code will only modify the file
-* Edit the original issue to get Sweep to recreate the PR from scratch"""
+> [!TIP]
+> To get Sweep to edit this pull request, you can:
+> * Comment below, and Sweep can edit the entire PR
+> * Comment on a file, Sweep will only modify the commented file
+> * Edit the original issue to get Sweep to recreate the PR from scratch"""
 
-
-def create_pr_changes(
+# this should be the only modification function
+def handle_file_change_requests(
     file_change_requests: list[FileChangeRequest],
-    pull_request: PullRequest,
-    sweep_bot: SweepBot,
+    request: str,
+    cloned_repo: ClonedRepo,
     username: str,
     installation_id: int,
-    issue_number: int | None = None,
-    sandbox=None,
-    chat_logger: ChatLogger = None,
-) -> Generator[tuple[FileChangeRequest, int], None, dict]:
-    # Flow:
-    # 1. Get relevant files
-    # 2: Get human message
-    # 3. Get files to change
-    # 4. Get file changes
-    # 5. Create PR
-    chat_logger = (
-        chat_logger
-        if chat_logger is not None
-        else ChatLogger(
-            {
-                "username": username,
-                "installation_id": installation_id,
-                "repo_full_name": sweep_bot.repo.full_name,
-                "title": pull_request.title,
-                "summary": "",
-                "issue_url": "",
-            }
-        )
-        if MONGODB_URI
-        else None
-    )
-    sweep_bot.chat_logger = chat_logger
-    organization, repo_name = sweep_bot.repo.full_name.split("/")
+    previous_modify_files_dict: dict = {},
+    renames_dict: dict = {},
+):
+    organization, repo_name = cloned_repo.repo.full_name.split("/")
     metadata = {
-        "repo_full_name": sweep_bot.repo.full_name,
+        "repo_full_name": cloned_repo.repo.full_name,
         "organization": organization,
         "repo_name": repo_name,
-        "repo_description": sweep_bot.repo.description,
+        "repo_description": cloned_repo.repo.description,
         "username": username,
         "installation_id": installation_id,
         "function": "create_pr",
         "mode": ENV,
-        "issue_number": issue_number,
     }
     posthog.capture(username, "started", properties=metadata)
 
     try:
-        logger.info("Making PR...")
-        pull_request.branch_name = sweep_bot.create_branch(pull_request.branch_name)
         completed_count, fcr_count = 0, len(file_change_requests)
 
-        blocked_dirs = get_blocked_dirs(sweep_bot.repo)
+        relevant_filepaths = []
+        for file_change_request in file_change_requests:
+            if file_change_request.relevant_files:
+                # keep all relevant_filepaths
+                for file_path in file_change_request.relevant_files:
+                    relevant_filepaths.append(file_path)
+        # actual modification logic
+        modify_files_dict = modify(
+            fcrs=file_change_requests,
+            request=request,
+            cloned_repo=cloned_repo,
+            relevant_filepaths=relevant_filepaths,
+            previous_modify_files_dict=previous_modify_files_dict,
+            renames_dict=renames_dict,
+        )
+        # If no files were updated, log a warning and return
+        if not modify_files_dict:
+            logger.warning(
+                "No changes made to any file!"
+            )
+            return (
+                modify_files_dict,
+                False,
+                file_change_requests,
+            )
+        
+        # update previous_modify_files_dict
+        if not previous_modify_files_dict:
+            previous_modify_files_dict = {}
+        if modify_files_dict:
+            for file_name, file_content in modify_files_dict.items():
+                previous_modify_files_dict[file_name] = copy.deepcopy(file_content)
+                # update status of corresponding fcr to be succeeded
+                for file_change_request in file_change_requests:
+                    if file_change_request.filename == file_name:
+                        file_change_request.status = "succeeded"
 
-        for (
-            file_change_request,
-            changed_file,
-            sandbox_error,
-        ) in sweep_bot.change_files_in_github_iterator(
-            file_change_requests,
-            pull_request.branch_name,
-            blocked_dirs,
-            sandbox=sandbox,
-        ):
-            completed_count += changed_file
-            logger.info("Completed {}/{} files".format(completed_count, fcr_count))
-            yield file_change_request, changed_file, sandbox_error
+        completed_count = len(modify_files_dict or [])
+        logger.info(f"Completed {completed_count}/{fcr_count} files")
         if completed_count == 0 and fcr_count != 0:
             logger.info("No changes made")
             posthog.capture(
@@ -119,29 +111,7 @@ def create_pr_changes(
                     **metadata,
                 },
             )
-
-            # Todo: if no changes were made, delete branch
-            error_msg = "No changes made"
-            commits = sweep_bot.repo.get_commits(pull_request.branch_name)
-            if commits.totalCount == 0:
-                branch = sweep_bot.repo.get_git_ref(f"heads/{pull_request.branch_name}")
-                branch.delete()
-                error_msg = "No changes made. Branch deleted."
-
-            return
-        # Include issue number in PR description
-        PR_CHECKOUT_COMMAND = f"To checkout this PR branch, run the following command in your terminal:\n```zsh\ngit checkout {pull_request.branch_name}\n```"
-        if issue_number:
-            # If the #issue changes, then change on_ticket (f'Fixes #{issue_number}.\n' in pr.body:)
-            pr_description = (
-                f"{pull_request.content}\n\nFixes"
-                f" #{issue_number}.\n\n---\n{PR_CHECKOUT_COMMAND}\n\n---\n\n{UPDATES_MESSAGE}\n\n---\n\n{INSTRUCTIONS_FOR_REVIEW}"
-            )
-        else:
-            pr_description = f"{pull_request.content}\n\n{PR_CHECKOUT_COMMAND}"
-        pr_title = pull_request.title
-        if "sweep.yaml" in pr_title:
-            pr_title = "[config] " + pr_title
+        return modify_files_dict, True, file_change_requests
     except MaxTokensExceeded as e:
         logger.error(e)
         posthog.capture(
@@ -154,7 +124,7 @@ def create_pr_changes(
             },
         )
         raise e
-    except openai.error.InvalidRequestError as e:
+    except openai.BadRequestError as e:
         logger.error(e)
         posthog.capture(
             username,
@@ -178,25 +148,6 @@ def create_pr_changes(
             },
         )
         raise e
-
-    posthog.capture(username, "success", properties={**metadata})
-    logger.info("create_pr success")
-    result = {
-        "success": True,
-        "pull_request": MockPR(
-            file_count=completed_count,
-            title=pr_title,
-            body=pr_description,
-            pr_head=pull_request.branch_name,
-            base=sweep_bot.repo.get_branch(
-                SweepConfig.get_branch(sweep_bot.repo)
-            ).commit,
-            head=sweep_bot.repo.get_branch(pull_request.branch_name).commit,
-        ),
-    }
-    yield result  # Doing this because sometiems using StopIteration doesn't work, kinda jank tho tbh
-    return
-
 
 def safe_delete_sweep_branch(
     pr,  # Github PullRequest
@@ -224,100 +175,69 @@ def safe_delete_sweep_branch(
         # Failed to delete branch as it was edited by someone else
         return False
 
-
-def create_config_pr(sweep_bot: SweepBot | None, repo: Repository = None):
+def create_config_pr(
+    repo: Repository = None, cloned_repo: ClonedRepo = None
+):
     if repo is not None:
         # Check if file exists in repo
         try:
             repo.get_contents("sweep.yaml")
             return
-        except Exception as e:
+        except Exception:
             pass
 
     title = "Configure Sweep"
     branch_name = GITHUB_CONFIG_BRANCH
-    if sweep_bot is not None:
-        branch_name = sweep_bot.create_branch(branch_name, retry=False)
-        try:
-            sweep_bot.repo.create_file(
-                "sweep.yaml",
-                "Create sweep.yaml",
-                GITHUB_DEFAULT_CONFIG.format(branch=sweep_bot.repo.default_branch),
-                branch=branch_name,
-            )
-            sweep_bot.repo.create_file(
-                ".github/ISSUE_TEMPLATE/sweep-template.yml",
-                "Create sweep template",
-                SWEEP_TEMPLATE,
-                branch=branch_name,
-            )
-            sweep_bot.repo.create_file(
-                ".github/ISSUE_TEMPLATE/sweep-slow-template.yml",
-                "Create sweep slow template",
-                SWEEP_SLOW_TEMPLATE,
-                branch=branch_name,
-            )
-            sweep_bot.repo.create_file(
-                ".github/ISSUE_TEMPLATE/sweep-fast-template.yml",
-                "Create sweep fast template",
-                SWEEP_FAST_TEMPLATE,
-                branch=branch_name,
-            )
-        except Exception as e:
-            logger.error(e)
-    else:
-        # Create branch based on default branch
-        branch = repo.create_git_ref(
-            ref=f"refs/heads/{branch_name}",
-            sha=repo.get_branch(repo.default_branch).commit.sha,
+    # Create branch based on default branch
+    repo.create_git_ref(
+        ref=f"refs/heads/{branch_name}",
+        sha=repo.get_branch(repo.default_branch).commit.sha,
+    )
+
+    try:
+        # commit_history = []
+        # if cloned_repo is not None:
+        #     commit_history = cloned_repo.get_commit_history(
+        #         limit=1000, time_limited=False
+        #     )
+        # commit_string = "\n".join(commit_history)
+
+        # sweep_yaml_bot = SweepYamlBot()
+        # generated_rules = sweep_yaml_bot.get_sweep_yaml_rules(
+        #     commit_history=commit_string
+        # )
+
+        repo.create_file(
+            "sweep.yaml",
+            "Create sweep.yaml",
+            GITHUB_DEFAULT_CONFIG.format(
+                branch=repo.default_branch, additional_rules=DEFAULT_RULES_STRING
+            ),
+            branch=branch_name,
         )
-
-        try:
-            repo.create_file(
-                "sweep.yaml",
-                "Create sweep.yaml",
-                GITHUB_DEFAULT_CONFIG.format(branch=repo.default_branch),
-                branch=branch_name,
-            )
-            repo.create_file(
-                ".github/ISSUE_TEMPLATE/sweep-template.yml",
-                "Create sweep template",
-                SWEEP_TEMPLATE,
-                branch=branch_name,
-            )
-            repo.create_file(
-                ".github/ISSUE_TEMPLATE/sweep-slow-template.yml",
-                "Create sweep slow template",
-                SWEEP_SLOW_TEMPLATE,
-                branch=branch_name,
-            )
-            repo.create_file(
-                ".github/ISSUE_TEMPLATE/sweep-fast-template.yml",
-                "Create sweep fast template",
-                SWEEP_FAST_TEMPLATE,
-                branch=branch_name,
-            )
-        except Exception as e:
-            logger.error(e)
-
-    repo = sweep_bot.repo if sweep_bot is not None else repo
+        repo.create_file(
+            ".github/ISSUE_TEMPLATE/sweep-template.yml",
+            "Create sweep template",
+            SWEEP_TEMPLATE,
+            branch=branch_name,
+        )
+    except Exception as e:
+        logger.error(e)
     # Check if the pull request from this branch to main already exists.
     # If it does, then we don't need to create a new one.
     if repo is not None:
         pull_requests = repo.get_pulls(
             state="open",
             sort="created",
-            base=SweepConfig.get_branch(repo)
-            if sweep_bot is not None
-            else repo.default_branch,
+            base=repo.default_branch,
             head=branch_name,
         )
         for pr in pull_requests:
             if pr.title == title:
                 return pr
 
-    print("Default branch", repo.default_branch)
-    print("New branch", branch_name)
+    logger.print("Default branch", repo.default_branch)
+    logger.print("New branch", branch_name)
     pr = repo.create_pull(
         title=title,
         body="""🎉 Thank you for installing Sweep! We're thrilled to announce the latest update for Sweep, your AI junior developer on GitHub. This PR creates a `sweep.yaml` config file, allowing you to personalize Sweep's performance according to your project requirements.
@@ -325,61 +245,22 @@ def create_config_pr(sweep_bot: SweepBot | None, repo: Repository = None):
         ## What's new?
         - **Sweep is now configurable**.
         - To configure Sweep, simply edit the `sweep.yaml` file in the root of your repository.
-        - If you need help, check out the [Sweep Default Config](https://github.com/sweepai/sweep/blob/main/sweep.yaml) or [Join Our Discord](https://discord.gg/sweep) for help.
+        - If you need help, check out the [Sweep Default Config](https://github.com/sweepai/sweep/blob/main/sweep.yaml) or [Join Our Discourse](https://community.sweep.dev/) for help.
 
         If you would like me to stop creating this PR, go to issues and say "Sweep: create an empty `sweep.yaml` file".
         Thank you for using Sweep! 🧹""".replace(
             "    ", ""
         ),
         head=branch_name,
-        base=SweepConfig.get_branch(repo)
-        if sweep_bot is not None
-        else repo.default_branch,
+        base=repo.default_branch,
     )
     pr.add_to_labels(GITHUB_LABEL_NAME)
     return pr
 
-
-def add_config_to_top_repos(installation_id, username, repositories, max_repos=3):
-    user_token, g = get_github_client(installation_id)
-
-    repo_activity = {}
-    for repo_entity in repositories:
-        repo = g.get_repo(repo_entity.full_name)
-        # instead of using total count, use the date of the latest commit
-        commits = repo.get_commits(
-            author=username,
-            since=datetime.datetime.now() - datetime.timedelta(days=30),
-        )
-        # get latest commit date
-        commit_date = datetime.datetime.now() - datetime.timedelta(days=30)
-        for commit in commits:
-            if commit.commit.author.date > commit_date:
-                commit_date = commit.commit.author.date
-
-        # since_date = datetime.datetime.now() - datetime.timedelta(days=30)
-        # commits = repo.get_commits(since=since_date, author="lukejagg")
-        repo_activity[repo] = commit_date
-        # print(repo, commits.totalCount)
-        print(repo, commit_date)
-
-    sorted_repos = sorted(repo_activity, key=repo_activity.get, reverse=True)
-    sorted_repos = sorted_repos[:max_repos]
-
-    # For each repo, create a branch based on main branch, then create PR to main branch
-    for repo in sorted_repos:
-        try:
-            print("Creating config for", repo.full_name)
-            create_config_pr(None, repo=repo)
-        except Exception as e:
-            print(e)
-    print("Finished creating configs for top repos")
-
-
 def create_gha_pr(g, repo):
     # Create a new branch
     branch_name = "sweep/gha-enable"
-    branch = repo.create_git_ref(
+    repo.create_git_ref(
         ref=f"refs/heads/{branch_name}",
         sha=repo.get_branch(repo.default_branch).commit.sha,
     )
@@ -407,48 +288,6 @@ def create_gha_pr(g, repo):
     return pr
 
 
-REFACTOR_TEMPLATE = """\
-name: Refactor
-title: 'Sweep: '
-description: Write something like "Modify the ... api endpoint to use ... version and ... framework"
-labels: sweep
-body:
-  - type: textarea
-    id: description
-    attributes:
-      label: Details
-      description: More details for Sweep
-      placeholder: We are migrating this function to ... version because ...
-"""
-
-BUGFIX_TEMPLATE = """\
-name: Bugfix
-title: 'Sweep: '
-description: Write something like "We notice ... behavior when ... happens instead of ...""
-labels: sweep
-body:
-  - type: textarea
-    id: description
-    attributes:
-      label: Details
-      description: More details about the bug
-      placeholder: The bug might be in ... file
-"""
-
-FEATURE_TEMPLATE = """\
-name: Feature Request
-title: 'Sweep: '
-description: Write something like "Write an api endpoint that does "..." in the "..." file"
-labels: sweep
-body:
-  - type: textarea
-    id: description
-    attributes:
-      label: Details
-      description: More details for Sweep
-      placeholder: The new endpoint should use the ... class from ... file because it contains ... logic
-"""
-
 SWEEP_TEMPLATE = """\
 name: Sweep Issue
 title: 'Sweep: '
@@ -461,41 +300,14 @@ body:
       label: Details
       description: Tell Sweep where and what to edit and provide enough context for a new developer to the codebase
       placeholder: |
-        Bugs: The bug might be in ... file. Here are the logs: ...
-        Features: the new endpoint should use the ... class from ... file because it contains ... logic.
+        Unit Tests: Write unit tests for <FILE>. Test each function in the file. Make sure to test edge cases.
+        Bugs: The bug might be in <FILE>. Here are the logs: ...
+        Features: the new endpoint should use the ... class from <FILE> because it contains ... logic.
         Refactors: We are migrating this function to ... version because ...
-"""
-
-SWEEP_SLOW_TEMPLATE = """\
-name: Sweep Slow Issue
-title: 'Sweep (slow): '
-description: For larger bugs, features, refactors, and tests to be handled by Sweep, an AI-powered junior developer. Sweep will perform a deeper search and more self-reviews but will take longer.
-labels: sweep
-body:
-  - type: textarea
-    id: description
+  - type: input
+    id: branch
     attributes:
-      label: Details
-      description: Tell Sweep where and what to edit and provide enough context for a new developer to the codebase
+      label: Branch
+      description: The branch to work off of (optional)
       placeholder: |
-        Bugs: The bug might be in ... file. Here are the logs: ...
-        Features: the new endpoint should use the ... class from ... file because it contains ... logic.
-        Refactors: We are migrating this function to ... version because ...
-"""
-
-SWEEP_FAST_TEMPLATE = """\
-name: Sweep Fast Issue
-title: 'Sweep (fast): '
-description: For few-line fixes to be handled by Sweep, an AI-powered junior developer. Sweep will use GPT-3.5 to quickly create a PR for very small changes.
-labels: sweep
-body:
-  - type: textarea
-    id: description
-    attributes:
-      label: Details
-      description: Tell Sweep where and what to edit and provide enough context for a new developer to the codebase
-      placeholder: |
-        Bugs: The bug might be in ... file. Here are the logs: ...
-        Features: the new endpoint should use the ... class from ... file because it contains ... logic.
-        Refactors: We are migrating this function to ... version because ...
-"""
+        main"""

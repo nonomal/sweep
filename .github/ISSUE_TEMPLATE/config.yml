@@ -1,0 +1,7 @@
+contact_links:
+  - name: Discourse
+    url: https://community.sweep.dev/
+    about: Feel free to report bugs and request features here!
+  - name: Docs
+    url: https://docs.sweep.dev
+    about: Check out how to self-deploy Sweep, usage guides and best practices

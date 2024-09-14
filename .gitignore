@@ -19,6 +19,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!platform/lib
 lib64/
 parts/
 sdist/
@@ -124,13 +125,14 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-.env
+*.env
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+.pythonlibs
 
 # Spyder project settings
 .spyderproject
@@ -177,3 +179,48 @@ repo
 dump.rdb
 depot.json
 repo.tar
+
+**logn_logs/
+logn_logs*
+sweep_docs/
+sweepai/sandbox/sandbox.venv
+.vscode/**
+benchmark
+data
+metals.*
+
+# certificates
+certs
+*.pem
+*.crt
+*.key
+*.srl
+*.csr
+*.pfx
+*.cert
+
+docker-compose
+.pdbrc.py
+
+ee/**
+eval/archive/**
+eval/**/*.txt
+eval/**/*.csv
+eval/**/*.jsonl
+eval/**/*.ans
+
+.worktrees
+
+*_import_graphs
+eval/**/*.ans
+eval/**/*.txt
+eval/**/*.ipynb
+eval/**/*.json
+# be cautious that txt files are now ignored
+**.txt
+sweepai_messages/**
+
+sweep_chat/cypress.env.json
+sweep_chat/cypress/screenshots
+sweep_chat/.env
+dockerfiles/
